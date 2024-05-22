@@ -16,9 +16,10 @@ class ServiceProvider extends LaravelServiceProvider
                 $config = $app['config']['cache.stores.redis'];
                 $prefix = $app['config']['cache.prefix'];
 
-                return Cache::repository(
-                    new Store($app['redis'], Str::beforeLast($prefix, ':'), $config['connection']),
-                );
+                // Symfony cache adds `:` to the end of namespace which is used as `prefix`
+                $prefix = Str::endsWith($prefix, ':') ? substr($prefix, 0, -1) : $prefix;
+
+                return Cache::repository(new Store($app['redis'], $prefix, $config['connection']));
             });
         });
     }
