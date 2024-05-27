@@ -39,6 +39,8 @@ class RedisTaggedCache extends Repository
             return $this->putMany($key, $value);
         }
 
+        $key = $this->store->cleanKey($key);
+
         if ($ttl === null) {
             return $this->forever($key, $value);
         }

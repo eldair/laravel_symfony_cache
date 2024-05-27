@@ -35,6 +35,13 @@ class Store extends TaggableStore implements LockProvider
     ) {
     }
 
+    // PSR-6 doesn't allow certain characters as cache keys, most notably `:` which laravel uses in their code. Maybe
+    // each forbidden character should be replaced with a unique pattern but this works for now.
+    public function cleanKey(string $key): string
+    {
+        return str_replace(str_split(ItemInterface::RESERVED_CHARACTERS), '.', $key);
+    }
+
     public function setConnection(string $connection): void
     {
         $this->connection = $connection;
@@ -63,7 +70,7 @@ class Store extends TaggableStore implements LockProvider
      */
     public function get($key)
     {
-        return $this->client()->getItem($key)->get();
+        return $this->client()->getItem($this->cleanKey($key))->get();
     }
 
     /**
@@ -74,7 +81,7 @@ class Store extends TaggableStore implements LockProvider
      */
     public function many(array $keys)
     {
-        $results = $this->client()->getItems($keys);
+        $results = $this->client()->getItems(array_map($this->cleanKey(...), $keys));
         return collect(iterator_to_array($results))->map(fn(ItemInterface $item) => $item->get())->toArray();
     }
 
@@ -88,23 +95,23 @@ class Store extends TaggableStore implements LockProvider
      */
     public function add($key, $value, $seconds)
     {
-        return $this->put($key, $value, $seconds);
+        return $this->put($this->cleanKey($key), $value, $seconds);
     }
 
     /**
      *
      * @param string $key
      * @param mixed $value
-     * @param int $seconds
+     * @param ?int $seconds
      * @return bool
      * @throws InvalidArgumentException
      */
     public function put($key, $value, $seconds)
     {
-        $item = $this->client()->getItem($key);
+        $item = $this->client()->getItem($this->cleanKey($key));
 
         $item->set($value);
-        $item->expiresAfter((int) max(1, $seconds));
+        $item->expiresAfter($seconds !== null ? (int) max(1, $seconds) : $seconds);
 
         return $this->client()->save($item);
     }
@@ -144,13 +151,14 @@ class Store extends TaggableStore implements LockProvider
         }
 
         $meta = $item->getMetadata();
-        $expiresAt = $meta[ItemInterface::METADATA_EXPIRY];
+        $expiresAt = $meta[ItemInterface::METADATA_EXPIRY] ?? 0;
 
-        return round($expiresAt - $this->currentTime());
+        return $expiresAt !== null ? round($expiresAt - $this->currentTime()) : null;
     }
 
     protected function incrementOrDecrement(string $key, int $value, Closure $callback): int|bool
     {
+        $key = $this->cleanKey($key);
         $currentValue = $this->get($key);
 
         if ($currentValue === null) {
@@ -199,7 +207,7 @@ class Store extends TaggableStore implements LockProvider
      */
     public function forever($key, $value)
     {
-        return $this->put($key, $value, 315_360_000);
+        return $this->put($key, $value, null);
     }
 
     /**
@@ -210,7 +218,7 @@ class Store extends TaggableStore implements LockProvider
      */
     public function forget($key)
     {
-        return $this->client()->deleteItem($key);
+        return $this->client()->deleteItem($this->cleanKey($key));
     }
 
     /**
