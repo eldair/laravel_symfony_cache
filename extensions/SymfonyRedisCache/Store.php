@@ -4,7 +4,9 @@ namespace Extensions\SymfonyRedisCache;
 
 use Symfony\Component\Cache\Exception\InvalidArgumentException;
 use Symfony\Component\Cache\Adapter\RedisTagAwareAdapter;
+use Illuminate\Redis\Connections\PhpRedisConnection;
 use Illuminate\Contracts\Redis\Factory as Redis;
+use Illuminate\Contracts\Cache\CanFlushLocks;
 use Illuminate\Contracts\Cache\LockProvider;
 use Illuminate\Redis\Connections\Connection;
 use Symfony\Contracts\Cache\ItemInterface;
@@ -12,34 +14,33 @@ use Illuminate\Support\InteractsWithTime;
 use Illuminate\Cache\TaggableStore;
 use Illuminate\Cache\PhpRedisLock;
 use Illuminate\Cache\RedisLock;
+use RuntimeException;
 use Closure;
 
-class Store extends TaggableStore implements LockProvider
+use function Illuminate\Support\enum_value;
+
+class Store extends TaggableStore implements CanFlushLocks, LockProvider
 {
     use InteractsWithTime;
 
-    protected ?string $lockConnection = null;
+    /**
+     * The name of the connection that should be used for locks.
+     */
+    protected ?string $lockConnection = '';
 
     /**
      * Create a new Redis store.
-     *
-     * @param  \Illuminate\Contracts\Redis\Factory  $redis
-     * @param  string  $prefix
-     * @param  string  $connection
-     * @return void
      */
     public function __construct(
         protected Redis $redis,
         protected string $prefix = '',
         protected string $connection = 'default',
-    ) {
-    }
+        protected array|bool|null $serializableClasses = null,
+    ) {}
 
-    // PSR-6 doesn't allow certain characters as cache keys, most notably `:` which laravel uses in their code. Maybe
-    // each forbidden character should be replaced with a unique pattern but this works for now.
     public function cleanKey(string $key): string
     {
-        return str_replace(str_split(ItemInterface::RESERVED_CHARACTERS), '.', $key);
+        return str_replace(str_split(ItemInterface::RESERVED_CHARACTERS), '.', enum_value($key));
     }
 
     public function setConnection(string $connection): void
@@ -52,10 +53,19 @@ class Store extends TaggableStore implements LockProvider
         return $this->redis->connection($this->connection);
     }
 
+    public function setLockConnection(string $connection): self
+    {
+        $this->lockConnection = $connection;
+        return $this;
+    }
+
+    public function lockConnection(): Connection
+    {
+        return $this->redis->connection($this->lockConnection ?? $this->connection);
+    }
+
     /**
      * Get the Redis connection instance.
-     *
-     * @return RedisTagAwareAdapter
      */
     public function client(): RedisTagAwareAdapter
     {
@@ -64,66 +74,79 @@ class Store extends TaggableStore implements LockProvider
 
     /**
      *
-     * @param string $key
-     * @return mixed
      * @throws InvalidArgumentException
      */
-    public function get($key)
+    public function get($key): mixed
     {
         return $this->client()->getItem($this->cleanKey($key))->get();
     }
 
     /**
      *
-     * @param array $keys
-     * @return array
      * @throws InvalidArgumentException
      */
-    public function many(array $keys)
+    public function many(array $keys): array
     {
+        if (count($keys) === 0) {
+            return [];
+        }
+
         $results = $this->client()->getItems(array_map($this->cleanKey(...), $keys));
-        return collect(iterator_to_array($results))->map(fn(ItemInterface $item) => $item->get())->toArray();
+
+        return collect(iterator_to_array($results))->map(fn(ItemInterface $item): mixed => $item->get())->toArray();
     }
 
     /**
      *
-     * @param string $key
-     * @param mixed $value
-     * @param int $seconds
-     * @return bool
      * @throws InvalidArgumentException
      */
-    public function add($key, $value, $seconds)
+    public function add(string $key, mixed $value, ?int $seconds): bool
     {
         return $this->put($this->cleanKey($key), $value, $seconds);
     }
 
+    public function checkForSerializableClasses(mixed $value): mixed
+    {
+        if (!is_object($value)) {
+            return $value;
+        }
+
+        if (!is_array($this->serializableClasses) || count($this->serializableClasses) === 0) {
+            throw new InvalidArgumentException('Provided object cannot be serialized per config.');
+        }
+
+        foreach ($this->serializableClasses as $serializableClasse) {
+            if ($value instanceof $serializableClasse) {
+                return $value;
+            }
+        }
+
+        throw new InvalidArgumentException('Provided object cannot be serialized per config.');
+    }
+
     /**
      *
      * @param string $key
      * @param mixed $value
-     * @param ?int $seconds
-     * @return bool
+     * @param int|null $seconds
      * @throws InvalidArgumentException
      */
-    public function put($key, $value, $seconds)
+    public function put($key, $value, $seconds): bool
     {
         $item = $this->client()->getItem($this->cleanKey($key));
 
-        $item->set($value);
-        $item->expiresAfter($seconds !== null ? (int) max(1, $seconds) : $seconds);
+        $item->set($this->checkForSerializableClasses($value));
+        $item->expiresAfter($seconds !== null ? max(1, $seconds) : $seconds);
 
         return $this->client()->save($item);
     }
 
     /**
      *
-     * @param array $values
-     * @param int $seconds
-     * @return bool
+     * @param int|null $seconds
      * @throws InvalidArgumentException
      */
-    public function putMany(array $values, $seconds)
+    public function putMany(array $values, $seconds): bool
     {
         $manyResult = null;
 
@@ -138,11 +161,9 @@ class Store extends TaggableStore implements LockProvider
 
     /**
      *
-     * @param string $key
-     * @return null|float|int
      * @throws InvalidArgumentException
      */
-    private function getExpiration($key): null|float|int
+    private function getExpiration(string $key): ?float
     {
         $item = $this->client()->getItem($key);
 
@@ -178,96 +199,33 @@ class Store extends TaggableStore implements LockProvider
      *
      * @param string $key
      * @param int $value
-     * @return int|bool
      * @throws InvalidArgumentException
      */
-    public function increment($key, $value = 1)
+    public function increment($key, $value = 1): int|bool
     {
-        return $this->incrementOrDecrement($key, $value, fn($current, $value) => $current + $value);
+        return $this->incrementOrDecrement($key, $value, fn($current, $value): float|int|array => $current + $value);
     }
 
     /**
      *
      * @param string $key
      * @param int $value
-     * @return int|bool
      * @throws InvalidArgumentException
      */
-    public function decrement($key, $value = 1)
+    public function decrement($key, $value = 1): int|bool
     {
-        return $this->incrementOrDecrement($key, $value, fn($current, $value) => $current - $value);
+        return $this->incrementOrDecrement($key, $value, fn($current, $value): int|float => $current - $value);
     }
 
     /**
      *
      * @param string $key
      * @param mixed $value
-     * @return bool
      * @throws InvalidArgumentException
      */
-    public function forever($key, $value)
+    public function forever($key, $value): bool
     {
         return $this->put($key, $value, null);
-    }
-
-    /**
-     *
-     * @param string $key
-     * @return bool
-     * @throws InvalidArgumentException
-     */
-    public function forget($key)
-    {
-        return $this->client()->deleteItem($this->cleanKey($key));
-    }
-
-    /**
-     *
-     * @return bool
-     */
-    public function flush()
-    {
-        return $this->client()->clear();
-    }
-
-    /**
-     *
-     * @return string
-     */
-    public function getPrefix()
-    {
-        return $this->prefix;
-    }
-
-    /**
-     * Sets the tags to be used
-     *
-     * @param array $tags
-     * @return RedisTaggedCache
-     */
-    public function tags($tags)
-    {
-        return new RedisTaggedCache($this, $tags);
-    }
-
-    /**
-     *
-     * @param string $connection
-     * @return Store
-     */
-    public function setLockConnection(string $connection): self
-    {
-        $this->lockConnection = $connection;
-        return $this;
-    }
-
-    /**
-     *
-     * @return Connection
-     */
-    public function lockConnection(): Connection
-    {
-        return $this->redis->connection($this->lockConnection ?? $this->connection);
     }
 
     /**
@@ -276,9 +234,8 @@ class Store extends TaggableStore implements LockProvider
      * @param  string  $name
      * @param  int  $seconds
      * @param  string|null  $owner
-     * @return \Illuminate\Contracts\Cache\Lock
      */
-    public function lock($name, $seconds = 0, $owner = null)
+    public function lock($name, $seconds = 0, $owner = null): PhpRedisLock|RedisLock
     {
         $lockName = $this->getPrefix() . $name;
 
@@ -296,10 +253,79 @@ class Store extends TaggableStore implements LockProvider
      *
      * @param  string  $name
      * @param  string  $owner
-     * @return \Illuminate\Contracts\Cache\Lock
      */
-    public function restoreLock($name, $owner)
+    public function restoreLock($name, $owner): PhpRedisLock|RedisLock
     {
         return $this->lock($name, 0, $owner);
+    }
+
+    /**
+     * Adjust the expiration time of a cached item.
+     *
+     * @param  string  $key
+     * @param  int  $seconds
+     */
+    public function touch($key, $seconds): bool
+    {
+        $item = $this->client()->getItem($this->cleanKey($key));
+        $item->expiresAfter((int) max(1, $seconds));
+
+        return $this->client()->save($item);
+    }
+
+    /**
+     *
+     * @param string $key
+     * @throws InvalidArgumentException
+     */
+    public function forget($key): bool
+    {
+        return $this->client()->deleteItem($this->cleanKey($key));
+    }
+
+    public function flush(): bool
+    {
+        return $this->client()->clear();
+    }
+
+    /**
+     * Determine if the lock store is separate from the cache store.
+     */
+    public function hasSeparateLockStore(): bool
+    {
+        return $this->lockConnection !== $this->connection;
+    }
+
+    /**
+     * Remove all locks from the store.
+     * @throws \RuntimeException
+     */
+    public function flushLocks(): bool
+    {
+        if (!$this->hasSeparateLockStore()) {
+            throw new RuntimeException(
+                'Flushing locks is only supported when the lock store is separate from the cache store.',
+            );
+        }
+
+        $this->lockConnection()->flushdb();
+
+        return true;
+    }
+
+    public function getPrefix(): string
+    {
+        return $this->prefix;
+    }
+
+    /**
+     * Sets the tags to be used
+     *
+     * @param array $tags
+     */
+    #[\Override]
+    public function tags($tags): RedisTaggedCache
+    {
+        return new RedisTaggedCache($this, $tags);
     }
 }

@@ -9,17 +9,28 @@ use Illuminate\Support\Str;
 
 class ServiceProvider extends LaravelServiceProvider
 {
-    public function register()
+    #[\Override]
+    public function register(): void
     {
-        $this->app->booting(function () {
+        $this->app->booting(function (): void {
             Cache::extend('redis', function (Application $app) {
-                $config = $app['config']['cache.stores.redis'];
-                $prefix = $app['config']['cache.prefix'];
+                $config = $app->make(\Illuminate\Contracts\Config\Repository::class)['cache.stores.redis'];
+                $prefix = $app->make(\Illuminate\Contracts\Config\Repository::class)['cache.prefix'];
+                $serializableClasse = $app->make(\Illuminate\Contracts\Config\Repository::class)[
+                    'cache.serializable_classes'
+                ];
 
                 // Symfony cache adds `:` to the end of namespace which is used as `prefix`
                 $prefix = Str::endsWith($prefix, ':') ? substr($prefix, 0, -1) : $prefix;
 
-                return Cache::repository(new Store($app['redis'], $prefix, $config['connection']));
+                return Cache::repository(
+                    new Store(
+                        $app->make(\Illuminate\Contracts\Redis\Factory::class),
+                        $prefix,
+                        $config['connection'],
+                        $serializableClasse,
+                    ),
+                );
             });
         });
     }
